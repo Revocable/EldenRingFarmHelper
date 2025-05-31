@@ -57,12 +57,13 @@ timer_event = threading.Event()
 last_action_press_time = 0.0
 sound_to_play = None
 joystick = None
-pygame_running = True
-app_running = True
+pygame_running = True # Controla o loop do pygame em si
+app_running = True    # Controla o estado geral da aplicação (rodando vs fechando)
+app_paused = False    # --- NOVO: Estado de pausa da aplicação ---
 
 # --- Variáveis de Controle de Captura de Botão ---
 capturing_button_mode = False
-target_button_index = ACTION_BUTTON_INDEX_DEFAULT # Inicializa com o padrão RB
+target_button_index = ACTION_BUTTON_INDEX_DEFAULT
 
 # --- Variáveis Globais para a UI ---
 ui_root = None
@@ -104,7 +105,7 @@ def update_controller_status_ui(message):
 def update_action_button_display_ui():
     global target_button_index
     if ui_root and ui_action_button_display_var and ui_root.winfo_exists():
-        display_text = f"Índice: {target_button_index}" if target_button_index is not None else "Nenhum (Clique em 'Definir Botão')"
+        display_text = f"Índice: {target_button_index}" if target_button_index is not None else "Nenhum (Defina abaixo)"
         ui_root.after(0, lambda: ui_action_button_display_var.set(display_text))
     logging.info(f"Display do botão de ação atualizado para: {target_button_index}")
 
@@ -122,14 +123,16 @@ def update_timer_display_ui(remaining_seconds, current_target_delay):
 
 def update_runtime_stats_ui():
     global app_running, program_start_time
-    if ui_root and ui_program_runtime_var and app_running and ui_root.winfo_exists():
+    # O tempo de execução continua contando mesmo se pausado, pois a app está "aberta"
+    if ui_root and ui_program_runtime_var and ui_root.winfo_exists(): # app_running não é mais a condição aqui
         elapsed_seconds = time.time() - program_start_time
         hours = int(elapsed_seconds // 3600)
         minutes = int((elapsed_seconds % 3600) // 60)
         seconds = int(elapsed_seconds % 60)
         ui_program_runtime_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-        if ui_root.winfo_exists():
+        if ui_root.winfo_exists(): # Verifica se a root ainda existe antes de reagendar
             ui_root.after(1000, update_runtime_stats_ui)
+
 
 def update_action_press_count_ui():
     global action_press_count
@@ -164,21 +167,26 @@ def generate_simple_beep(frequency=440, duration_ms=200, sample_rate=44100):
         return None
 
 def timer_and_sound_task():
-    global last_action_press_time, sound_to_play, current_delay_seconds, app_running
+    global last_action_press_time, sound_to_play, current_delay_seconds, app_running, app_paused
     logging.info("Thread timer_and_sound_task iniciada.")
     update_main_status_ui("Aguardando Botão de Ação...")
     try:
-        while app_running:
-            if not timer_event.wait(timeout=0.5):
-                if not app_running:
+        while app_running: # Loop principal da thread, continua mesmo se app_paused
+            if not timer_event.wait(timeout=0.5): # Espera pelo evento do botão de ação
+                if not app_running: # Se a aplicação foi fechada, sai
                     logging.debug("timer_and_sound_task: app_running é False, saindo do loop de espera.")
                     break
-                continue
+                continue # Volta a esperar se não houve evento e app ainda está rodando
 
             logging.debug("timer_and_sound_task: timer_event recebido.")
             timer_event.clear()
-            current_activation_time = last_action_press_time
 
+            if app_paused: # Se a aplicação está pausada, não inicia o timer
+                logging.info("timer_and_sound_task: Aplicação pausada, timer não iniciado.")
+                update_main_status_ui("Pausado. Pressione Continuar.")
+                continue # Volta a esperar pelo próximo evento (ou despausar)
+
+            current_activation_time = last_action_press_time
             delay_to_use = float(ui_delay_var.get()) if ui_root and ui_delay_var and ui_delay_var.get() else current_delay_seconds
             update_main_status_ui(f"Botão! Timer de {delay_to_use:.1f}s iniciado.")
             logging.info(f"Timer iniciado com delay: {delay_to_use}s")
@@ -186,26 +194,48 @@ def timer_and_sound_task():
             time_elapsed_total = 0
 
             while time_elapsed_total < delay_to_use and app_running:
+                if app_paused: # Se pausado durante a contagem
+                    # Para uma pausa real, precisaria salvar state e quebrar o loop interno.
+                    # Por simplicidade, o timer continua em background mas o som pode não tocar.
+                    # Ou, para congelar visualmente:
+                    time_to_freeze_display_at = delay_to_use - time_elapsed_total
+                    update_timer_display_ui(time_to_freeze_display_at, delay_to_use)
+                    logging.info(f"timer_and_sound_task: Pausado durante contagem. Tempo restante congelado em {time_to_freeze_display_at:.2f}s.")
+                    # Espera até ser despausado ou app fechar
+                    while app_paused and app_running:
+                        time.sleep(0.1)
+                    if not app_running: break
+                    # Ao despausar, recalcular o tempo de ativação para continuar de onde parou
+                    current_activation_time = time.time() - time_elapsed_total
+                    logging.info(f"timer_and_sound_task: Despausado. Retomando contagem.")
+                    update_main_status_ui(f"Continuando timer de {delay_to_use:.1f}s...")
+
+
                 time_remaining = delay_to_use - time_elapsed_total
                 update_timer_display_ui(time_remaining, delay_to_use)
                 wait_interval = min(time_remaining, 0.05)
 
-                if timer_event.wait(timeout=wait_interval):
+                if timer_event.wait(timeout=wait_interval): # Verifica se o botão foi pressionado novamente (reset)
+                    if app_paused: # Se pausado, ignora o reset do timer por botão.
+                        timer_event.clear() # Limpa o evento para não processar no próximo ciclo
+                        logging.info("timer_and_sound_task: Reset de timer ignorado (pausado).")
+                        continue
+
                     logging.debug("timer_and_sound_task: timer_event recebido durante a contagem (reset).")
                     timer_event.clear()
                     current_activation_time = last_action_press_time
                     delay_to_use = float(ui_delay_var.get()) if ui_root and ui_delay_var and ui_delay_var.get() else current_delay_seconds
                     update_main_status_ui(f"Botão Reset! Novo timer de {delay_to_use:.1f}s.")
                     logging.info(f"Timer resetado com novo delay: {delay_to_use}s")
-                    time_elapsed_total = 0
-                    continue
+                    time_elapsed_total = 0 # Reseta o tempo decorrido
+                    continue # Volta para o início do loop de contagem
 
                 if not app_running:
                     logging.debug("timer_and_sound_task: app_running é False, saindo do loop de contagem.")
                     break
                 time_elapsed_total = time.time() - current_activation_time
 
-            if app_running and time_elapsed_total >= delay_to_use:
+            if app_running and not app_paused and time_elapsed_total >= delay_to_use: # Só toca som se não estiver pausado
                 update_timer_display_ui(0, delay_to_use)
                 update_main_status_ui("Timer finalizado. Tocando som...")
                 logging.info("Timer finalizado, tentando tocar som.")
@@ -216,7 +246,6 @@ def timer_and_sound_task():
 
                 if should_play_sound and sound_to_play:
                     try:
-                        # O volume já foi definido no sound_to_play pelo slider
                         sound_to_play.play()
                         logging.debug("Som reproduzido.")
                     except pygame.error as e_play:
@@ -229,6 +258,10 @@ def timer_and_sound_task():
                     update_main_status_ui("Som desabilitado.")
                     logging.info("Som desabilitado pela UI.")
                 update_main_status_ui("Aguardando Botão de Ação...")
+            elif app_running and app_paused and time_elapsed_total >= delay_to_use:
+                update_timer_display_ui(0, delay_to_use) # Atualiza display mesmo pausado
+                update_main_status_ui("Timer finalizado (durante pausa). Som não tocado.")
+                logging.info("Timer finalizado durante pausa. Som não tocado.")
             elif not app_running:
                 update_main_status_ui("Timer interrompido (app_running False).")
                 logging.info("Timer interrompido pois app_running se tornou False.")
@@ -242,7 +275,7 @@ def timer_and_sound_task():
 
 
 def pygame_loop():
-    global joystick, sound_to_play, last_action_press_time, pygame_running, app_running, \
+    global joystick, sound_to_play, last_action_press_time, pygame_running, app_running, app_paused, \
            capturing_button_mode, target_button_index
     logging.info("Thread pygame_loop iniciada.")
 
@@ -268,10 +301,6 @@ def pygame_loop():
         if not pygame.mixer.get_init():
             logging.warning("Módulo Pygame Mixer não pôde ser inicializado.")
             update_main_status_ui("⚠️ Mixer de áudio não disponível.")
-        else: # Se o mixer inicializou, definir o volume global do mixer (para futuros sons se necessário)
-            if FarmHelperApp.instance and FarmHelperApp.instance.volume_var:
-                 # pygame.mixer.music.set_volume(FarmHelperApp.instance.volume_var.get()) # Para música
-                 pass # Para sons individuais, o volume é definido no objeto Sound
 
         logging.info("Pygame (core, joystick, mixer) inicializado/verificado no pygame_loop.")
 
@@ -307,18 +336,21 @@ def pygame_loop():
             update_main_status_ui("Falha no beep. Sem áudio.")
             logging.error("sound_to_play continua None após tentativas de carga/geração.")
         else:
-            # --- NOVO: Aplicar volume inicial ao som carregado ---
             if FarmHelperApp.instance and FarmHelperApp.instance.volume_var:
                 initial_volume = FarmHelperApp.instance.volume_var.get()
                 sound_to_play.set_volume(initial_volume)
                 logging.info(f"Volume inicial do som '{SOUND_FILE_PATH or 'beep'}' definido para {initial_volume:.2f}")
 
 
-        while pygame_running and app_running:
+        while pygame_running: # Loop do Pygame continua mesmo se app_paused, para eventos de UI e joystick
+            if not app_running: # Se app_running se tornar False (app fechando), então pygame_running também deve se tornar
+                pygame_running = False
+                break
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     logging.info("Evento QUIT do Pygame recebido.")
-                    pygame_running = False; app_running = False
+                    pygame_running = False; app_running = False # Sinaliza para todas as threads pararem
                     if ui_root and ui_root.winfo_exists(): ui_root.event_generate("<<AppClosing>>")
                     break
 
@@ -355,7 +387,7 @@ def pygame_loop():
                                 update_controller_status_ui("🔴 Erro controle alternativo.")
 
                 if event.type == pygame.JOYBUTTONDOWN:
-                    if capturing_button_mode:
+                    if capturing_button_mode: # Captura de botão funciona mesmo se pausado
                         target_button_index = event.button
                         capturing_button_mode = False
                         update_action_button_display_ui()
@@ -364,8 +396,7 @@ def pygame_loop():
                         if FarmHelperApp.instance and hasattr(FarmHelperApp.instance, 'define_button_btn'):
                             if FarmHelperApp.instance.define_button_btn.winfo_exists():
                                 FarmHelperApp.instance.define_button_btn.config(state=tk.NORMAL, text="🎯 Definir Botão de Ação")
-
-                    elif target_button_index is not None:
+                    elif not app_paused and target_button_index is not None: # Só processa botão de ação se não estiver pausado
                         logging.debug(f"Botão do controle pressionado: {event.button} no joystick {event.instance_id}. Alvo: {target_button_index}")
                         if joystick and hasattr(joystick, 'get_instance_id') and \
                            event.instance_id == joystick.get_instance_id() and \
@@ -374,54 +405,37 @@ def pygame_loop():
                             last_action_press_time = time.time()
                             increment_action_press_count_and_update_ui()
                             timer_event.set()
+                    elif app_paused and target_button_index is not None and \
+                         joystick and hasattr(joystick, 'get_instance_id') and \
+                         event.instance_id == joystick.get_instance_id() and \
+                         event.button == target_button_index:
+                        logging.info(f"Botão de Ação ({target_button_index}) pressionado, mas app está pausado. Ignorando.")
+                        update_main_status_ui("Pausado. Pressione Continuar para usar o botão de ação.")
+
+
             if not pygame_running: break
             time.sleep(0.02)
     except Exception as e_pygame:
         logging.critical(f"Erro crítico na thread Pygame: {e_pygame}", exc_info=True)
-        update_controller_status_ui(f"Erro Pygame: {e_pygame}")
+        if app_running: update_controller_status_ui(f"Erro Pygame: {e_pygame}")
     finally:
         if pygame and pygame.get_init():
             pygame.quit()
         logging.info("Thread Pygame e Pygame finalizados.")
         if app_running : update_controller_status_ui("Pygame finalizado.")
-        if app_running:
-            app_running = False
+        # Se o pygame_loop terminar (ex: por erro), deve sinalizar para fechar a app
+        if app_running: # Se app ainda estava "rodando" mas pygame parou
+            app_running = False # Sinaliza para outras threads e UI fecharem
             if ui_root and ui_root.winfo_exists(): ui_root.event_generate("<<AppClosing>>")
 
-class ScrolledFrame(ttk.Frame):
-    def __init__(self, parent, *args, **kw):
-        canvas_bg_color = kw.pop('bg', '#1a1a1a')
-        ttk.Frame.__init__(self, parent, *args, **kw)
-
-        vscrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL)
-        vscrollbar.pack(fill=tk.Y, side=tk.RIGHT, expand=tk.FALSE)
-        self.canvas = tk.Canvas(self, bd=0, highlightthickness=0,
-                                yscrollcommand=vscrollbar.set, bg=canvas_bg_color)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.TRUE)
-        vscrollbar.config(command=self.canvas.yview)
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
-        self.interior = ttk.Frame(self.canvas, style='Interior.TFrame', padding=kw.get('padding', (5,5)))
-        self.interior_id = self.canvas.create_window(0, 0, window=self.interior, anchor=tk.NW)
-        self.interior.bind('<Configure>', self._configure_interior)
-        self.canvas.bind('<Configure>', self._configure_canvas)
-
-    def _configure_interior(self, event):
-        size = (self.interior.winfo_reqwidth(), self.interior.winfo_reqheight())
-        self.canvas.config(scrollregion=(0, 0, size[0], size[1]))
-        if self.interior.winfo_reqwidth() != self.canvas.winfo_width():
-            self.canvas.config(width=max(self.interior.winfo_reqwidth(), self.canvas.winfo_width()))
-
-    def _configure_canvas(self, event):
-        if self.interior.winfo_reqwidth() != self.canvas.winfo_width():
-            self.canvas.itemconfigure(self.interior_id, width=self.canvas.winfo_width())
 
 class FarmHelperApp:
     instance = None
     def __init__(self, master_root):
         global ui_root, ui_status_var, ui_delay_var, ui_controller_status_var, \
                ui_time_remaining_var, ui_progress_var, current_delay_seconds, \
-               ui_program_runtime_var, ui_action_press_count_var, ui_action_button_display_var
+               ui_program_runtime_var, ui_action_press_count_var, ui_action_button_display_var, \
+               app_running, app_paused # Adicionado app_paused
 
         FarmHelperApp.instance = self
         self.master_root = master_root
@@ -432,7 +446,11 @@ class FarmHelperApp:
         self.master_root.configure(bg='#0d1117')
         self.center_window()
 
-        ui_status_var = tk.StringVar(master_root, value="🚀 Inicializando sistema...")
+        # --- ALTERAÇÃO: Estado inicial ---
+        app_running = True # Aplicação está rodando ao iniciar
+        app_paused = False # Não está pausada ao iniciar
+
+        ui_status_var = tk.StringVar(master_root, value="🚀 Sistema iniciado. Aguardando ação...") # Mensagem inicial
         ui_delay_var = tk.StringVar(master_root, value=f"{INITIAL_DELAY_SECONDS:.1f}")
         current_delay_seconds = INITIAL_DELAY_SECONDS
         ui_controller_status_var = tk.StringVar(master_root, value="🔍 Verificando controles...")
@@ -442,22 +460,19 @@ class FarmHelperApp:
         ui_program_runtime_var = tk.StringVar(master_root, value="00:00:00")
         ui_action_press_count_var = tk.StringVar(master_root, value="0")
         ui_action_button_display_var = tk.StringVar(master_root, value=f"Índice: {target_button_index}")
-
-        # --- NOVO: Variável para o volume ---
-        self.initial_volume = 0.7 # 70%
+        self.initial_volume = 0.7
         self.volume_var = tk.DoubleVar(master_root, value=self.initial_volume)
 
-
         self.setup_styles()
-        self.create_widgets() # Chamado após setup_styles
+        self.create_widgets()
         self.setup_ui_bindings()
 
-        update_main_status_ui("✅ Interface carregada com sucesso!")
+        update_main_status_ui("✅ Monitoramento ativo. Aguardando botão de ação.") # Atualiza status
         if ui_root.winfo_exists():
             update_runtime_stats_ui()
         update_action_press_count_ui()
         update_action_button_display_ui()
-        self.on_volume_change(self.volume_var.get()) # Para definir o label de porcentagem inicial
+        self.on_volume_change(self.volume_var.get())
 
     def center_window(self):
         self.master_root.update_idletasks()
@@ -487,23 +502,14 @@ class FarmHelperApp:
             'SectionTitle.TLabel': {'font': ('Segoe UI', 14, 'bold'), 'foreground': self.colors['accent_blue'], 'background': self.colors['bg_tertiary'], 'padding': (15, 10, 15, 5)},
             'Status.TLabel': {'font': ('Segoe UI', 11), 'foreground': self.colors['text_primary'], 'background': self.colors['bg_tertiary'], 'padding': (15, 12), 'anchor': 'center', 'relief': 'flat'},
             'Controller.Status.TLabel': {'font': ('Segoe UI', 10), 'foreground': self.colors['text_primary'], 'background': self.colors['bg_tertiary'], 'padding': (15, 8), 'anchor': 'center'},
-            'Stats.TLabel': {'font': ('Segoe UI', 10), 'foreground': self.colors['text_secondary'], 'background': self.colors['bg_tertiary']}, # Removido padding global aqui, será por widget
+            'Stats.TLabel': {'font': ('Segoe UI', 10), 'foreground': self.colors['text_secondary'], 'background': self.colors['bg_tertiary']},
             'Timer.TLabel': {'font': ('Consolas', 42, 'bold'), 'foreground': self.colors['accent_green'], 'background': self.colors['bg_tertiary'], 'anchor': 'center', 'padding': (20, 15)},
             'Modern.TButton': {'font': ('Segoe UI', 10, 'bold'), 'padding': (20, 12), 'background': self.colors['accent_blue'], 'foreground': self.colors['text_primary'], 'relief': 'flat', 'borderwidth': 0, 'focuscolor': 'none'},
             'Success.TButton': {'font': ('Segoe UI', 11, 'bold'), 'padding': (20, 15), 'background': self.colors['accent_green'], 'foreground': self.colors['text_primary'], 'relief': 'flat', 'borderwidth': 0, 'focuscolor': 'none'},
-            'Warning.TButton': {'font': ('Segoe UI', 10, 'bold'), 'padding': (20, 12), 'background': self.colors['accent_orange'], 'foreground': self.colors['text_primary'], 'relief': 'flat', 'borderwidth': 0, 'focuscolor': 'none'},
+            'Warning.TButton': {'font': ('Segoe UI', 11, 'bold'), 'padding': (20, 15), 'background': self.colors['accent_orange'], 'foreground': self.colors['text_primary'], 'relief': 'flat', 'borderwidth': 0, 'focuscolor': 'none'}, # Aumentei a fonte para consistência
             'TProgressbar': {'thickness': 25, 'background': self.colors['accent_green'], 'troughcolor': self.colors['bg_secondary'], 'borderwidth': 0, 'lightcolor': self.colors['accent_green'], 'darkcolor': self.colors['accent_green']},
-            'TCheckbutton': {'font': ('Segoe UI', 10), 'foreground': self.colors['text_primary'], 'background': self.colors['bg_tertiary'], 'indicatorcolor': self.colors['text_primary'], 'padding': (0,0), 'focuscolor': 'none'}, # Removido padding global aqui
-            # --- NOVO: Estilo para o TScale (Slider de Volume) ---
-            'Volume.Horizontal.TScale': {
-                'troughcolor': self.colors['bg_secondary'],
-                'background': self.colors['accent_blue'],  # Cor do thumb (botão deslizante)
-                'relief': 'flat',
-                'sliderrelief': 'flat',
-                'borderwidth': 0,
-                'sliderthickness': 18, # Altura do canal e thumb
-                'focuscolor': 'none' # Remove o anel de foco padrão do Tk
-            }
+            'TCheckbutton': {'font': ('Segoe UI', 10), 'foreground': self.colors['text_primary'], 'background': self.colors['bg_tertiary'], 'indicatorcolor': self.colors['text_primary'], 'padding': (0,0), 'focuscolor': 'none'},
+            'Volume.Horizontal.TScale': {'troughcolor': self.colors['bg_secondary'], 'background': self.colors['accent_blue'], 'relief': 'flat', 'sliderrelief': 'flat', 'borderwidth': 0, 'sliderthickness': 18, 'focuscolor': 'none'}
         }
         for style_name, config in styles_config.items():
             self.style.configure(style_name, **config)
@@ -512,11 +518,7 @@ class FarmHelperApp:
         self.style.map('Success.TButton', background=[('active', '#2ea043'), ('pressed', self.colors['accent_green'])], foreground=[('active', self.colors['text_primary']), ('pressed', self.colors['text_primary'])])
         self.style.map('Warning.TButton', background=[('active', '#bb8009'), ('pressed', self.colors['accent_orange'])], foreground=[('active', self.colors['text_primary']), ('pressed', self.colors['text_primary'])])
         self.style.map('TCheckbutton', background=[('active', self.colors['hover'])], indicatorcolor=[('selected', self.colors['accent_green'])])
-        # --- NOVO: Estilo de map para o TScale ---
-        self.style.map('Volume.Horizontal.TScale',
-            background=[('active', self.colors['accent_purple']), ('pressed', self.colors['accent_purple'])], # Thumb quando interagindo
-            troughcolor=[('active', self.colors['hover'])]
-        )
+        self.style.map('Volume.Horizontal.TScale', background=[('active', self.colors['accent_purple']), ('pressed', self.colors['accent_purple'])], troughcolor=[('active', self.colors['hover'])])
 
     def create_section(self, parent_column, title_text, icon=""):
         section_frame = ttk.Frame(parent_column, style='TFrame')
@@ -604,77 +606,66 @@ class FarmHelperApp:
 
         # === COLUNA DIREITA - Opções e Estatísticas ===
         options_section_content = self.create_section(right_column, "Opções", "⚙️")
-
-        # Checkbox de som
         sound_check_frame = ttk.Frame(options_section_content, style='Card.TFrame')
-        sound_check_frame.pack(fill=tk.X, padx=15, pady=(10,5)) # Menos pady bottom
+        sound_check_frame.pack(fill=tk.X, padx=15, pady=(10,5))
         sound_check = ttk.Checkbutton(sound_check_frame, text="🔊 Som habilitado", variable=self.sound_enabled_var, style='TCheckbutton')
-        sound_check.pack(anchor=tk.W, pady=5) # Menos pady
-
-        # --- NOVO: Controles de Volume ---
+        sound_check.pack(anchor=tk.W, pady=5)
         volume_control_frame = ttk.Frame(options_section_content, style='Card.TFrame')
-        volume_control_frame.pack(fill=tk.X, padx=15, pady=(5, 15)) # pady top para separar do check
-
+        volume_control_frame.pack(fill=tk.X, padx=15, pady=(5, 15))
         volume_label = ttk.Label(volume_control_frame, text="🎧 Volume:", style='Stats.TLabel', background=self.colors['bg_tertiary'])
         volume_label.pack(side=tk.LEFT, padx=(0, 10), pady=5)
-
-        self.volume_slider = ttk.Scale(volume_control_frame, from_=0.0, to=1.0,
-                                       orient=tk.HORIZONTAL, variable=self.volume_var,
-                                       command=self.on_volume_change, style='Volume.Horizontal.TScale')
+        self.volume_slider = ttk.Scale(volume_control_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, variable=self.volume_var, command=self.on_volume_change, style='Volume.Horizontal.TScale')
         self.volume_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=5)
-
         self.volume_percentage_label = ttk.Label(volume_control_frame, text="", style='Stats.TLabel', background=self.colors['bg_tertiary'], width=4, anchor=tk.E)
         self.volume_percentage_label.pack(side=tk.LEFT, padx=(10, 0), pady=5)
-        # --- FIM NOVO: Controles de Volume ---
 
         stats_section_content = self.create_section(right_column, "Estatísticas", "📊")
         stats_frame = ttk.Frame(stats_section_content, style='Card.TFrame')
         stats_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
         runtime_container = ttk.Frame(stats_frame, style='Card.TFrame')
         runtime_container.pack(fill=tk.X, pady=(10, 8))
-        ttk.Label(runtime_container, text="⏰ Tempo de Execução:", style='Stats.TLabel', padding=(0,0,5,0)).pack(anchor=tk.W) # Padding no label
+        ttk.Label(runtime_container, text="⏰ Tempo de Execução:", style='Stats.TLabel', padding=(0,0,5,0)).pack(anchor=tk.W)
         ttk.Label(runtime_container, textvariable=ui_program_runtime_var, font=('Consolas', 12, 'bold'), foreground=self.colors['accent_blue'], background=self.colors['bg_tertiary']).pack(anchor=tk.W, padx=(20, 0))
         action_container = ttk.Frame(stats_frame, style='Card.TFrame')
         action_container.pack(fill=tk.X, pady=(8, 10))
-        ttk.Label(action_container, text="🎯 Ações Executadas:", style='Stats.TLabel', padding=(0,0,5,0)).pack(anchor=tk.W) # Padding no label
+        ttk.Label(action_container, text="🎯 Ações Executadas:", style='Stats.TLabel', padding=(0,0,5,0)).pack(anchor=tk.W)
         ttk.Label(action_container, textvariable=ui_action_press_count_var, font=('Consolas', 12, 'bold'), foreground=self.colors['accent_green'], background=self.colors['bg_tertiary']).pack(anchor=tk.W, padx=(20, 0))
 
         app_controls_section_content = self.create_section(right_column, "Controles", "🕹️")
         controls_frame = ttk.Frame(app_controls_section_content, style='Card.TFrame')
         controls_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
-        self.start_stop_btn = ttk.Button(controls_frame, text="▶️ Iniciar Monitoramento", command=self.toggle_app_running, style='Success.TButton')
-        self.start_stop_btn.pack(fill=tk.X, pady=(10, 8))
-        ttk.Button(controls_frame, text="💥 Simular Ação (F5)", command=self.simulate_action_press_ui, style='Modern.TButton').pack(fill=tk.X, pady=4)
-        ttk.Button(controls_frame, text="🔄 Reset Timer (ESC)", command=self.reset_visual_timer_ui, style='Warning.TButton').pack(fill=tk.X, pady=(4, 10))
+        
+        # --- ALTERAÇÃO: Botão Pausar/Continuar ---
+        self.pause_resume_btn = ttk.Button(controls_frame, text="⏸️ Pausar",
+                                           command=self.toggle_pause_resume, style='Success.TButton') # Inicialmente 'Success'
+        self.pause_resume_btn.pack(fill=tk.X, pady=(10, 8))
+        # --- FIM ALTERAÇÃO ---
 
-    # --- NOVO: Função para lidar com a mudança de volume ---
+
     def on_volume_change(self, value_str):
         try:
             volume = float(value_str)
             if self.volume_percentage_label and self.volume_percentage_label.winfo_exists():
                 self.volume_percentage_label.config(text=f"{int(volume * 100)}%")
-
             if pygame and pygame.mixer.get_init() and sound_to_play:
                 sound_to_play.set_volume(volume)
                 logging.info(f"Volume do som ajustado para: {volume:.2f}")
-            elif pygame and pygame.mixer.get_init():
-                 # Se sound_to_play ainda não foi carregado, o volume será aplicado quando ele for.
-                 # pygame.mixer.music.set_volume(volume) # Se fosse usar música
-                 pass
-        except ValueError:
-            logging.error(f"Valor inválido para volume: {value_str}")
-        except Exception as e:
-            logging.error(f"Erro ao definir volume: {e}", exc_info=True)
+        except ValueError: logging.error(f"Valor inválido para volume: {value_str}")
+        except Exception as e: logging.error(f"Erro ao definir volume: {e}", exc_info=True)
 
 
     def setup_ui_bindings(self):
         self.master_root.protocol("WM_DELETE_WINDOW", self.ui_on_app_closing)
         self.master_root.bind("<<AppClosing>>", lambda e: self.ui_on_app_closing() if app_running else None)
-        self.master_root.bind('<F5>', lambda event: self.simulate_action_press_ui())
-        self.master_root.bind('<Escape>', lambda event: self.reset_visual_timer_ui())
+        # --- ALTERAÇÃO: Remover bindings de F5 e ESC ---
+        # self.master_root.bind('<F5>', lambda event: self.simulate_action_press_ui())
+        # self.master_root.bind('<Escape>', lambda event: self.reset_visual_timer_ui())
 
     def start_button_capture_mode(self):
-        global capturing_button_mode
+        global capturing_button_mode, app_paused
+        if app_paused: # Não permitir captura se pausado
+            messagebox.showinfo("Pausado", "Despause a aplicação para definir o botão.", parent=self.master_root)
+            return
         if joystick is None or not (hasattr(joystick, 'get_init') and joystick.get_init()):
             messagebox.showwarning("Controle Necessário", "Conecte um controle antes de definir o botão.", parent=self.master_root)
             return
@@ -710,42 +701,34 @@ class FarmHelperApp:
             ui_delay_var.set(f"{current_delay_seconds:.1f}")
         self.master_root.focus_set()
 
-    def toggle_app_running(self):
-        global app_running, pygame_running
-        if app_running:
-            if messagebox.askyesno("Parar Monitoramento", "Deseja parar o monitoramento e fechar as tarefas de fundo?", parent=self.master_root):
-                update_main_status_ui("🛑 Parando monitoramento...")
-                app_running = False
-                pygame_running = False
-                if timer_event: timer_event.set()
-                self.start_stop_btn.configure(text="▶️ Reiniciar (Requer Restart)", style='Warning.TButton')
-                self.start_stop_btn.configure(state=tk.DISABLED)
-                update_controller_status_ui("🔴 Monitoramento parado.")
+    # --- ALTERAÇÃO: Função para Pausar/Continuar ---
+    def toggle_pause_resume(self):
+        global app_paused
+        app_paused = not app_paused
+        if app_paused:
+            self.pause_resume_btn.configure(text="▶️ Continuar", style='Warning.TButton')
+            update_main_status_ui("⏸️ Aplicação Pausada. Pressione Continuar para retomar.")
+            logging.info("Aplicação Pausada.")
+            # Desabilitar outros botões que não devem funcionar enquanto pausado
+            if hasattr(self, 'define_button_btn'): self.define_button_btn.config(state=tk.DISABLED)
         else:
-            if messagebox.askyesno("Reiniciar Aplicação", "Para reiniciar o monitoramento, a aplicação precisa ser reiniciada. Deseja fazer isso agora?", parent=self.master_root):
-                self.ui_on_app_closing(force_quit=True, restart=True)
+            self.pause_resume_btn.configure(text="⏸️ Pausar", style='Success.TButton')
+            update_main_status_ui("▶️ Aplicação Retomada. Aguardando botão de ação.")
+            logging.info("Aplicação Retomada.")
+            # Reabilitar botões
+            if hasattr(self, 'define_button_btn'): self.define_button_btn.config(state=tk.NORMAL)
+            # Se um timer estava rodando e foi pausado, pode ser necessário
+            # 'acordar' a thread do timer se ela estiver esperando em timer_event.wait()
+            # No entanto, a lógica atual de timer_and_sound_task já lida com a retomada da contagem.
 
-    def simulate_action_press_ui(self):
-        global last_action_press_time, timer_event, app_running, target_button_index
-        if not app_running:
-            messagebox.showwarning("Aviso", "O monitoramento não está ativo.", parent=self.master_root)
-            return
-        if target_button_index is None:
-            messagebox.showwarning("Aviso", "Nenhum botão de ação foi definido. Clique em 'Definir Botão de Ação'.", parent=self.master_root)
-            return
-        logging.info("Simulando pressão do Botão de Ação pela UI.")
-        last_action_press_time = time.time()
-        increment_action_press_count_and_update_ui()
-        timer_event.set()
-        update_main_status_ui("💥 Ação simulada com sucesso!")
 
-    def reset_visual_timer_ui(self):
-        if ui_root and ui_root.winfo_exists():
-            update_timer_display_ui(0, 1)
-            if ui_progress_var: ui_progress_var.set(0)
-            update_main_status_ui("🔄 Timer resetado. Aguardando próxima ação...")
+    # --- Funções removidas (simulate_action_press_ui, reset_visual_timer_ui) ---
 
     def ui_init_joystick_command(self):
+        global app_paused
+        if app_paused:
+            messagebox.showinfo("Pausado", "Despause a aplicação para verificar controles.", parent=self.master_root)
+            return
         logging.info("Botão 'Verificar Controles' pressionado. A detecção é automática.")
         update_controller_status_ui("🔍 Verificando controles...")
         if joystick is None or not (hasattr(joystick, 'get_init') and joystick.get_init()):
@@ -753,8 +736,8 @@ class FarmHelperApp:
         else:
              update_controller_status_ui(f"🟢 {joystick.get_name()[:25]} (Verificado)")
 
-    def ui_on_app_closing(self, force_quit=False, restart=False):
-        global app_running, pygame_running, pygame_thread_global, timer_sound_thread_global
+    def ui_on_app_closing(self, force_quit=False, restart=False): # `restart` não é mais usado aqui
+        global app_running, pygame_running, app_paused
         confirmed_to_close = force_quit
         if not force_quit:
             confirmed_to_close = messagebox.askokcancel("Sair", "Você tem certeza que quer sair do FarmHelper Pro?", parent=self.master_root)
@@ -762,25 +745,28 @@ class FarmHelperApp:
         if confirmed_to_close:
             logging.info("Usuário confirmou o fechamento pela GUI.")
             update_main_status_ui("🔄 Finalizando aplicação...")
-            app_running = False
-            pygame_running = False
-            if timer_event: timer_event.set()
+            app_running = False    # Sinaliza para todas as threads principais pararem
+            app_paused = False     # Garante que não está mais pausado para permitir fechamento limpo
+            pygame_running = False # Sinaliza para o loop do pygame parar
+            
+            if timer_event: timer_event.set() # Acorda a thread do timer para que ela possa verificar app_running
 
             if pygame_thread_global and pygame_thread_global.is_alive():
                 logging.info("Aguardando thread Pygame...")
-                pygame_thread_global.join(timeout=1.0)
+                pygame_thread_global.join(timeout=1.5) # Aumentar um pouco o timeout
             if timer_sound_thread_global and timer_sound_thread_global.is_alive():
                 logging.info("Aguardando thread Timer/Som...")
-                timer_sound_thread_global.join(timeout=1.0)
+                timer_sound_thread_global.join(timeout=1.5)
 
             if self.master_root and self.master_root.winfo_exists():
                 self.master_root.destroy()
             logging.info("Aplicação GUI finalizada.")
 
-            if restart:
-                logging.info("Reiniciando a aplicação...")
-                python = sys.executable
-                os.execl(python, python, *sys.argv)
+            # A funcionalidade de restart via botão foi removida. Se precisar, pode ser chamada externamente.
+            # if restart:
+            #     logging.info("Reiniciando a aplicação...")
+            #     python = sys.executable
+            #     os.execl(python, python, *sys.argv)
 
 pygame_thread_global = None
 timer_sound_thread_global = None
@@ -824,6 +810,7 @@ if __name__ == "__main__":
         logging.info("Aplicação finalizada a partir do bloco __main__.")
         app_running = False
         pygame_running = False
+        app_paused = False # Garante que está despausado para finalização
         if timer_event: timer_event.set()
 
         if pygame_thread_global and pygame_thread_global.is_alive():

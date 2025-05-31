@@ -1,2 +1,6 @@
 rb_timer_app_gui.log
 farm_helper_gui.log
+venv
+build
+dist
+FarmHelperPro.spec
